@@ -1,11 +1,10 @@
 [wrap-file]
-directory = gobject-introspection-1.74.0
-source_url = https://download.gnome.org/sources/gobject-introspection/1.74/gobject-introspection-1.74.0.tar.xz
-source_fallback_url = https://ftp.acc.umu.se/pub/gnome/sources/gobject-introspection/1.74/gobject-introspection-1.74.0.tar.xz
-source_filename = gobject-introspection-1.74.0.tar.xz
-source_hash = 347b3a719e68ba4c69ff2d57ee2689233ea8c07fc492205e573386779e42d653
-wrapdb_version = 1.74.0-0
-diff_files = gobject-introspection-1.74.0/0001-Fix-gir-build-when-using-subprojects-dependencies.patch, gobject-introspection-1.74.0/0001-gir-stop-assuming-glib-source-and-build-dirs-using-v.patch
+directory = gobject-introspection-1.82.0
+source_url = https://download.gnome.org/sources/gobject-introspection/1.82/gobject-introspection-1.82.0.tar.xz
+source_fallback_url = https://ftp.acc.umu.se/pub/gnome/sources/gobject-introspection/1.82/gobject-introspection-1.82.0.tar.xz
+source_filename = gobject-introspection-1.82.0.tar.xz
+source_hash = 0f5a4c1908424bf26bc41e9361168c363685080fbdb87a196c891c8401ca2f09
+wrapdb_version = 1.82.0-0
 
 [provide]
 dependency_names = gobject-introspection-1.0
