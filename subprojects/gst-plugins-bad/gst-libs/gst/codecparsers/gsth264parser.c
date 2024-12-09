@@ -1111,12 +1111,6 @@ gst_h264_parser_parse_user_data_unregistered (GstH264NalParser * nalparser,
     READ_UINT8 (nr, data[i], 8);
   }
 
-  if (payload_size < 1) {
-    GST_WARNING ("No more remaining payload data to store");
-    g_clear_pointer (&data, g_free);
-    return GST_H264_PARSER_BROKEN_DATA;
-  }
-
   urud->data = data;
   GST_MEMDUMP ("SEI user data unregistered", data, payload_size);
   return GST_H264_PARSER_OK;
@@ -1413,6 +1407,7 @@ gst_h264_parser_parse_sei_message (GstH264NalParser * nalparser,
 
 error:
   GST_WARNING ("error parsing \"Sei message\"");
+  gst_h264_sei_clear (sei);
   return GST_H264_PARSER_ERROR;
 }
 
@@ -1440,7 +1435,7 @@ gst_h264_nal_parser_new (void)
  * gst_h264_nal_parser_free:
  * @nalparser: the #GstH264NalParser to free
  *
- * Frees @nalparser and sets it to %NULL
+ * Frees @nalparser
  */
 void
 gst_h264_nal_parser_free (GstH264NalParser * nalparser)
@@ -1452,8 +1447,6 @@ gst_h264_nal_parser_free (GstH264NalParser * nalparser)
   for (i = 0; i < GST_H264_MAX_PPS_COUNT; i++)
     gst_h264_pps_clear (&nalparser->pps[i]);
   g_free (nalparser);
-
-  nalparser = NULL;
 }
 
 /**

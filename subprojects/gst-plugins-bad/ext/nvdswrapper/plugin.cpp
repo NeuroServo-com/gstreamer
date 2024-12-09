@@ -1,6 +1,5 @@
 /* GStreamer
- * Copyright (C) 2020 Collabora Ltd.
- *   Author: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+ * Copyright (C) 2024 Seungha Yang <seungha@centricular.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -18,20 +17,30 @@
  * Boston, MA 02110-1301, USA.
  */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <gst/gst.h>
+#include <gst/cuda/gstcuda.h>
+#include "gstnvdsdewarp.h"
 
-#include "gstv4l2codecallocator.h"
+static gboolean
+plugin_init (GstPlugin * plugin)
+{
+  if (!gst_cuda_load_library ()) {
+    gst_plugin_add_status_warning (plugin, "CUDA library was not found.");
+    return TRUE;
+  }
 
-#ifndef __GST_V4L2_CODEC_POOL_H__
-#define __GST_V4L2_CODEC_POOL_H__
+  gst_element_register (plugin, "nvdsdewarp", GST_RANK_NONE,
+      GST_TYPE_NV_DS_DEWARP);
 
-#define GST_TYPE_V4L2_CODEC_POOL gst_v4l2_codec_pool_get_type()
-G_DECLARE_FINAL_TYPE(GstV4l2CodecPool, gst_v4l2_codec_pool, GST,
-    V4L2_CODEC_POOL, GstBufferPool)
+  return TRUE;
+}
 
-GstV4l2CodecPool *gst_v4l2_codec_pool_new  (GstV4l2CodecAllocator *allocator,
-                                            const GstVideoInfoDmaDrm * vinfo_drm);
-
-guint32           gst_v4l2_codec_buffer_get_index (GstBuffer * buffer);
-
-#endif /* __GST_V4L2_CODEC_POOL_H__ */
+GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
+    GST_VERSION_MINOR,
+    nvdswrapper,
+    "NVIDIA DeepStream wrapper plugin",
+    plugin_init, VERSION, "LGPL", GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)

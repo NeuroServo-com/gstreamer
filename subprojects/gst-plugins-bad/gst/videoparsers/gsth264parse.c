@@ -354,6 +354,7 @@ gst_h264_parse_stop (GstBaseParse * parse)
   gst_h264_parse_reset (h264parse);
 
   gst_h264_nal_parser_free (h264parse->nalparser);
+  h264parse->nalparser = NULL;
 
   return TRUE;
 }
@@ -622,9 +623,6 @@ gst_h264_parse_process_sei_user_data_unregistered (GstH264Parse * h264parse,
     GstH264UserDataUnregistered * urud)
 {
   GstByteReader br;
-
-  if (urud->data == NULL || urud->size < 1)
-    return;
 
   gst_byte_reader_init (&br, urud->data, urud->size);
 

@@ -1,6 +1,5 @@
 /* GStreamer
- * Copyright (C) 2020 Collabora Ltd.
- *   Author: Nicolas Dufresne <nicolas.dufresne@collabora.com>
+ * Copyright (C) 2024 Seungha Yang <seungha@centricular.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Library General Public
@@ -18,20 +17,15 @@
  * Boston, MA 02110-1301, USA.
  */
 
+#pragma once
+
 #include <gst/gst.h>
+#include <gst/base/gstbasetransform.h>
 
-#include "gstv4l2codecallocator.h"
+G_BEGIN_DECLS
 
-#ifndef __GST_V4L2_CODEC_POOL_H__
-#define __GST_V4L2_CODEC_POOL_H__
+#define GST_TYPE_NV_DS_DEWARP (gst_nv_ds_dewarp_get_type())
+G_DECLARE_FINAL_TYPE (GstNvDsDewarp, gst_nv_ds_dewarp,
+    GST, NV_DS_DEWARP, GstBaseTransform)
 
-#define GST_TYPE_V4L2_CODEC_POOL gst_v4l2_codec_pool_get_type()
-G_DECLARE_FINAL_TYPE(GstV4l2CodecPool, gst_v4l2_codec_pool, GST,
-    V4L2_CODEC_POOL, GstBufferPool)
-
-GstV4l2CodecPool *gst_v4l2_codec_pool_new  (GstV4l2CodecAllocator *allocator,
-                                            const GstVideoInfoDmaDrm * vinfo_drm);
-
-guint32           gst_v4l2_codec_buffer_get_index (GstBuffer * buffer);
-
-#endif /* __GST_V4L2_CODEC_POOL_H__ */
+G_END_DECLS

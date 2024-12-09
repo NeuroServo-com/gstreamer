@@ -47,14 +47,16 @@ static GstVideoInfo in_info;
 static GstVideoInfo out_info;
 typedef struct
 {
-  GstVulkanEncodePicture *picture;
+  GstVulkanEncoderPicture picture;
+
+  gboolean is_ref;
+  gint pic_num;
+  gint pic_order_cnt;
 
   VkVideoEncodeH265PictureInfoKHR enc_pic_info;
   VkVideoEncodeH265NaluSliceSegmentInfoKHR slice_info;
   VkVideoEncodeH265DpbSlotInfoKHR dpb_slot_info;
   VkVideoEncodeH265RateControlInfoKHR rc_info;
-  VkVideoEncodeH265RateControlLayerInfoKHR rc_layer_info;
-  VkVideoEncodeH265QualityLevelPropertiesKHR quality_level;
 
   StdVideoEncodeH265WeightTable slice_wt;
   StdVideoEncodeH265SliceSegmentHeader slice_hdr;
@@ -66,22 +68,25 @@ typedef struct
 
 
 static GstVulkanH265EncodeFrame *
-_h265_encode_frame_new (GstVulkanEncodePicture * picture)
+_h265_encode_frame_new (GstVulkanEncoder * enc, GstBuffer * img_buffer,
+    gsize size, gboolean is_ref)
 {
   GstVulkanH265EncodeFrame *frame;
 
-  g_return_val_if_fail (picture, NULL);
   frame = g_new (GstVulkanH265EncodeFrame, 1);
-  frame->picture = picture;
+  fail_unless (gst_vulkan_encoder_picture_init (&frame->picture, enc,
+          img_buffer, size));
+  frame->is_ref = is_ref;
 
   return frame;
 }
 
 static void
-_h265_encode_frame_free (gpointer pframe)
+_h265_encode_frame_free (GstVulkanEncoder * enc, gpointer pframe)
 {
   GstVulkanH265EncodeFrame *frame = pframe;
-  g_clear_pointer (&frame->picture, gst_vulkan_encode_picture_free);
+
+  gst_vulkan_encoder_picture_clear (&frame->picture, enc);
   g_free (frame);
 }
 
@@ -352,7 +357,7 @@ error:
 /* allocate a frame to be encoded from given buffer pools */
 static GstVulkanH265EncodeFrame *
 allocate_frame (GstVulkanEncoder * enc, int width,
-    int height, gboolean is_ref, gint nb_refs)
+    int height, gboolean is_ref)
 {
   GstVulkanH265EncodeFrame *frame;
   GstBuffer *in_buffer, *img_buffer;
@@ -363,11 +368,8 @@ allocate_frame (GstVulkanEncoder * enc, int width,
   /* get a Vulkan image buffer out of the input buffer */
   upload_buffer_to_image(img_pool, in_buffer, &img_buffer);
 
-
-  frame = _h265_encode_frame_new (gst_vulkan_encode_picture_new (enc, img_buffer, width, height, is_ref,
-      nb_refs));
+  frame = _h265_encode_frame_new (enc, img_buffer, width * height * 3, is_ref);
   fail_unless (frame);
-  fail_unless (frame->picture);
   gst_buffer_unref (in_buffer);
   gst_buffer_unref (img_buffer);
 
@@ -382,25 +384,73 @@ allocate_frame (GstVulkanEncoder * enc, int width,
     (StdVideoH265PictureType) slice_type
 
 static void
+setup_codec_pic (GstVulkanEncoderPicture * pic, VkVideoEncodeInfoKHR * info,
+    gpointer data)
+{
+  GstVulkanH265EncodeFrame *frame = (GstVulkanH265EncodeFrame *) pic;
+
+  info->pNext = &frame->enc_pic_info;
+  pic->dpb_slot.pNext = &frame->dpb_slot_info;
+
+  {
+    /* *INDENT-OFF* */
+    frame->enc_pic_info = (VkVideoEncodeH265PictureInfoKHR) {
+      .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PICTURE_INFO_KHR,
+      .pNext = NULL,
+      .naluSliceSegmentEntryCount = 1,
+      .pNaluSliceSegmentEntries = &frame->slice_info,
+      .pStdPictureInfo = &frame->pic_info,
+    };
+    frame->dpb_slot_info = (VkVideoEncodeH265DpbSlotInfoKHR) {
+      .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR,
+      .pNext = NULL,
+      .pStdReferenceInfo = &frame->ref_info,
+    };
+    /* *INDENT-ON* */
+  }
+}
+
+static void
+setup_rc_codec (GstVulkanEncoderPicture * pic,
+    VkVideoEncodeRateControlInfoKHR * rc_info,
+    VkVideoEncodeRateControlLayerInfoKHR * rc_layer, gpointer data)
+{
+  GstVulkanH265EncodeFrame *frame = (GstVulkanH265EncodeFrame *) pic;
+
+  /* *INDENT-OFF* */
+  frame->rc_info = (VkVideoEncodeH265RateControlInfoKHR) {
+    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_RATE_CONTROL_INFO_KHR,
+    .flags = VK_VIDEO_ENCODE_H264_RATE_CONTROL_REFERENCE_PATTERN_FLAT_BIT_KHR |
+        VK_VIDEO_ENCODE_H264_RATE_CONTROL_REGULAR_GOP_BIT_KHR,
+    .pNext = NULL,
+    .gopFrameCount = 1,
+    .idrPeriod = 1,
+    .consecutiveBFrameCount = 0,
+  };
+  /* *INDENT-ON* */
+
+  rc_info->pNext = &frame->rc_info;
+}
+
+static void
 encode_frame (GstVulkanEncoder * enc, GstVulkanH265EncodeFrame * frame,
     StdVideoH265SliceType slice_type, guint frame_num,
     GstVulkanH265EncodeFrame ** list0, gint list0_num,
     GstVulkanH265EncodeFrame ** list1, gint list1_num, gint vps_id, gint sps_id,
     gint pps_id)
 {
-  GstVulkanVideoCapabilities enc_caps;
   int i, ref_pics_num = 0;
-  GstVulkanEncodePicture *ref_pics[16] = { NULL, };
+  GstVulkanEncoderPicture *ref_pics[16] = { NULL, };
   gint16 delta_poc_s0_minus1 = 0, delta_poc_s1_minus1 = 0;
-  guint qp_i = 26;
-  guint qp_p = 26;
-  guint qp_b = 26;
-  GstVulkanEncodePicture *picture = frame->picture;
-  gint picture_type = PICTURE_TYPE(slice_type, picture->is_ref);
+  GstVulkanEncoderPicture *picture = &frame->picture;
+  gint picture_type = PICTURE_TYPE (slice_type, frame->is_ref);
+  GstVulkanEncoderCallbacks cb = { setup_codec_pic, setup_rc_codec };
 
   GST_DEBUG ("Encoding frame num: %d", frame_num);
 
-  fail_unless (gst_vulkan_encoder_caps (enc, &enc_caps));
+  gst_vulkan_encoder_set_callbacks (enc, &cb, NULL, NULL);
+
+  ref_pics_num = list0_num + list1_num;
 
   frame->slice_wt = (StdVideoEncodeH265WeightTable) {
     /* *INDENT-OFF* */
@@ -455,14 +505,10 @@ encode_frame (GstVulkanEncoder * enc, GstVulkanH265EncodeFrame * frame,
     /* *INDENT-ON* */
   };
 
-  if (list0_num) {
-    delta_poc_s0_minus1 =
-        picture->pic_order_cnt - list0[0]->picture->pic_order_cnt - 1;
-  }
-  if (list1_num) {
-    delta_poc_s1_minus1 =
-        list1[0]->picture->pic_order_cnt - picture->pic_order_cnt - 1;
-  }
+  if (list0_num)
+    delta_poc_s0_minus1 = frame->pic_order_cnt - list0[0]->pic_order_cnt - 1;
+  if (list1_num)
+    delta_poc_s1_minus1 = list1[0]->pic_order_cnt - frame->pic_order_cnt - 1;
 
   frame->short_term_ref_pic_set = (StdVideoH265ShortTermRefPicSet) {
     /* *INDENT-OFF* */
@@ -486,7 +532,7 @@ encode_frame (GstVulkanEncoder * enc, GstVulkanH265EncodeFrame * frame,
   frame->pic_info = (StdVideoEncodeH265PictureInfo) {
     /* *INDENT-OFF* */
     .flags = (StdVideoEncodeH265PictureInfoFlags) {
-          .is_reference = picture->is_ref,
+          .is_reference = frame->is_ref,
           .IrapPicFlag = (picture_type == STD_VIDEO_H265_PICTURE_TYPE_IDR),
           .used_for_long_term_reference = 0,
           .discardable_flag = 0,
@@ -500,13 +546,13 @@ encode_frame (GstVulkanEncoder * enc, GstVulkanH265EncodeFrame * frame,
     .sps_video_parameter_set_id = vps_id,
     .pps_seq_parameter_set_id = sps_id,
     .pps_pic_parameter_set_id = pps_id,
-    .PicOrderCntVal = picture->pic_order_cnt,
+    .PicOrderCntVal = frame->pic_order_cnt,
     .pShortTermRefPicSet = &frame->short_term_ref_pic_set,
     .pLongTermRefPics = NULL,
     /* *INDENT-ON* */
   };
 
-  if (picture->nb_refs) {
+  if (ref_pics_num > 0) {
     frame->ref_list_info = (StdVideoEncodeH265ReferenceListsInfo) {
       /* *INDENT-OFF* */
       .flags = (StdVideoEncodeH265ReferenceListsInfoFlags) {
@@ -529,101 +575,41 @@ encode_frame (GstVulkanEncoder * enc, GstVulkanH265EncodeFrame * frame,
   memset (frame->ref_list_info.RefPicList1, STD_VIDEO_H265_NO_REFERENCE_PICTURE,
       STD_VIDEO_H265_MAX_NUM_LIST_REF);
 
+  /* *INDENT-OFF* */
   frame->slice_info = (VkVideoEncodeH265NaluSliceSegmentInfoKHR) {
-    /* *INDENT-OFF* */
     .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_NALU_SLICE_SEGMENT_INFO_KHR,
     .pNext = NULL,
     .pStdSliceSegmentHeader = &frame->slice_hdr,
-    /* *INDENT-ON* */
-  };
-
-  frame->rc_layer_info = (VkVideoEncodeH265RateControlLayerInfoKHR) {
-    /* *INDENT-OFF* */
-    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_LAYER_INFO_KHR,
-    .pNext = NULL,
-    .useMinQp = TRUE,
-    .minQp = (VkVideoEncodeH265QpKHR){ qp_i, qp_p, qp_b },
-    .useMaxQp = TRUE,
-    .maxQp = (VkVideoEncodeH265QpKHR){ qp_i, qp_p, qp_b },
-    .useMaxFrameSize = 0,
-    .maxFrameSize = (VkVideoEncodeH265FrameSizeKHR) {0, 0, 0},
-    /* *INDENT-ON* */
   };
 
   frame->rc_info = (VkVideoEncodeH265RateControlInfoKHR) {
-    /* *INDENT-OFF* */
     .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_INFO_KHR,
-    .pNext = &frame->rc_layer_info,
-    .gopFrameCount = 0,
-    .idrPeriod = 0,
-    .consecutiveBFrameCount = 0,
-    /* *INDENT-ON* */
-  };
-
-  frame->quality_level = (VkVideoEncodeH265QualityLevelPropertiesKHR) {
-    /* *INDENT-OFF* */
-    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_QUALITY_LEVEL_PROPERTIES_KHR,
-    .pNext = NULL,
-    .preferredRateControlFlags = VK_VIDEO_ENCODE_H265_RATE_CONTROL_REGULAR_GOP_BIT_KHR,
-    .preferredGopFrameCount = 0,
-    .preferredIdrPeriod = 0,
-    .preferredConsecutiveBFrameCount = 0,
-    .preferredConstantQp = (VkVideoEncodeH265QpKHR){ qp_i, qp_p, qp_b },
-    .preferredMaxL0ReferenceCount = 0,
-    .preferredMaxL1ReferenceCount = 0,
-    /* *INDENT-ON* */
-  };
-
-  frame->enc_pic_info = (VkVideoEncodeH265PictureInfoKHR) {
-    /* *INDENT-OFF* */
-    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PICTURE_INFO_KHR,
-    .pNext = NULL,
-    .naluSliceSegmentEntryCount = 1,
-    .pNaluSliceSegmentEntries = &frame->slice_info,
-    .pStdPictureInfo = &frame->pic_info,
-    /* *INDENT-ON* */
   };
 
   frame->ref_info = (StdVideoEncodeH265ReferenceInfo) {
-    /* *INDENT-OFF* */
     .flags = (StdVideoEncodeH265ReferenceInfoFlags) {
       .used_for_long_term_reference = 0,
       .unused_for_reference = 0,
     },
     .pic_type = picture_type,
-    .PicOrderCntVal = picture->pic_order_cnt,
+    .PicOrderCntVal = frame->pic_order_cnt,
     .TemporalId = 0,
-    /* *INDENT-ON* */
   };
+  /* *INDENT-ON* */
 
-  frame->dpb_slot_info = (VkVideoEncodeH265DpbSlotInfoKHR) {
-    /* *INDENT-OFF* */
-    .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_DPB_SLOT_INFO_KHR,
-    .pNext = NULL,
-    .pStdReferenceInfo = &frame->ref_info,
-    /* *INDENT-ON* */
-  };
-
-  picture->codec_pic_info = &frame->enc_pic_info;
-  picture->codec_rc_layer_info = &frame->rc_layer_info;
   picture->codec_rc_info = &frame->rc_info;
-  picture->codec_quality_level = &frame->quality_level;
-  picture->codec_dpb_slot_info = &frame->dpb_slot_info;
 
   for (i = 0; i < list0_num; i++) {
-    ref_pics[i] = list0[i]->picture;
-    frame->ref_list_info.RefPicList0[0] = list0[i]->picture->slotIndex;
-    ref_pics_num++;
+    ref_pics[i] = &list0[i]->picture;
+    frame->ref_list_info.RefPicList0[0] = list0[i]->picture.dpb_slot.slotIndex;
   }
   for (i = 0; i < list1_num; i++) {
-    ref_pics[i + list0_num] = list1[i]->picture;
-    ref_pics_num++;
-    frame->ref_list_info.RefPicList1[i] = list1[i]->picture->slotIndex;
+    ref_pics[i + list0_num] = &list1[i]->picture;
+    frame->ref_list_info.RefPicList1[i] = list1[i]->picture.dpb_slot.slotIndex;
   }
 
-  picture->nb_refs = ref_pics_num;
-
-  fail_unless (gst_vulkan_encoder_encode (enc, picture, ref_pics));
+  fail_unless (gst_vulkan_encoder_encode (enc, &in_info, picture, ref_pics_num,
+          ref_pics));
 }
 
 static void
@@ -746,9 +732,10 @@ setup_h265_encoder (uint32_t width, uint32_t height, gint vps_id,
   gint min_ctb_size = 64, max_ctb_size = 16;
   gint max_tb_size = 0, min_tb_size = 0;
   gint max_transform_hierarchy;
+  GstVulkanEncoderQualityProperties quality_props;
 
+  /* *INDENT-OFF* */
   profile = (GstVulkanVideoProfile) {
-    /* *INDENT-OFF* */
     .profile = {
       .sType = VK_STRUCTURE_TYPE_VIDEO_PROFILE_INFO_KHR,
       .pNext = &profile.codec,
@@ -768,8 +755,14 @@ setup_h265_encoder (uint32_t width, uint32_t height, gint vps_id,
       .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR,
       .stdProfileIdc = profile_idc,
     }
-    /* *INDENT-ON* */
   };
+  quality_props = (GstVulkanEncoderQualityProperties) {
+    .quality_level = -1,
+    .codec.h265 = {
+      .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_QUALITY_LEVEL_PROPERTIES_KHR,
+    },
+  };
+  /* *INDENT-ON* */
 
   for (i = 0; i < instance->n_physical_devices; i++) {
     GstVulkanDevice *device = gst_vulkan_device_new_with_index (instance, i);
@@ -800,57 +793,54 @@ setup_h265_encoder (uint32_t width, uint32_t height, gint vps_id,
     return NULL;
   }
 
-  fail_unless (gst_vulkan_encoder_start (enc, &profile, width * height * 3,
-          &err));
+  fail_unless (gst_vulkan_encoder_quality_level (enc) == -1);
+
+  fail_unless (gst_vulkan_encoder_start (enc, &profile, &quality_props, &err));
+
+  fail_unless (gst_vulkan_encoder_quality_level (enc) > -1);
+
+  fail_unless (gst_vulkan_encoder_is_started (enc));
 
   fail_unless (gst_vulkan_encoder_caps (enc, &enc_caps));
 
-
-  if (enc_caps.codec.h265enc.
-      ctbSizes & VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR) {
+  if (enc_caps.encoder.codec.h265.ctbSizes
+      & VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR)
     max_ctb_size = 64;
-  } else if (enc_caps.codec.h265enc.
-      ctbSizes & VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR) {
+  else if (enc_caps.encoder.codec.h265.ctbSizes
+      & VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR)
     max_ctb_size = 32;
-  }
-
-  if (enc_caps.codec.h265enc.
-      ctbSizes & VK_VIDEO_ENCODE_H265_CTB_SIZE_16_BIT_KHR) {
+  else if (enc_caps.encoder.codec.h265.ctbSizes
+      & VK_VIDEO_ENCODE_H265_CTB_SIZE_16_BIT_KHR)
     min_ctb_size = 16;
-  } else if (enc_caps.codec.h265enc.
-      ctbSizes & VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR) {
-    min_ctb_size = 32;
-  }
 
-  if (enc_caps.codec.h265enc.transformBlockSizes &
+  if (enc_caps.encoder.codec.h265.transformBlockSizes &
       VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR)
     min_tb_size = 4;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes &
       VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_8_BIT_KHR)
     min_tb_size = 8;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes &
       VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_16_BIT_KHR)
     min_tb_size = 16;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes &
       VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_32_BIT_KHR)
     min_tb_size = 32;
 
-  if (enc_caps.codec.h265enc.transformBlockSizes &
-      VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_32_BIT_KHR)
+  if (enc_caps.encoder.codec.h265.transformBlockSizes
+      & VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_32_BIT_KHR)
     max_tb_size = 32;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
-      VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_16_BIT_KHR)
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes
+      & VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_16_BIT_KHR)
     max_tb_size = 16;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
-      VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_8_BIT_KHR)
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes
+      & VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_8_BIT_KHR)
     max_tb_size = 8;
-  else if (enc_caps.codec.h265enc.transformBlockSizes &
-      VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR)
+  else if (enc_caps.encoder.codec.h265.transformBlockSizes
+      & VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR)
     max_tb_size = 4;
 
   max_transform_hierarchy =
       gst_util_ceil_log2 (max_ctb_size) - gst_util_ceil_log2 (min_tb_size);
-
 
   h265_std_ptl.general_profile_idc = profile_idc;
   h265_std_vps.vps_video_parameter_set_id = vps_id;
@@ -878,20 +868,22 @@ setup_h265_encoder (uint32_t width, uint32_t height, gint vps_id,
   h265_std_sps.conf_win_bottom_offset = 0;
 
   h265_std_pps.flags.transform_skip_enabled_flag =
-      enc_caps.codec.h265enc.stdSyntaxFlags &
-      VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_SET_BIT_KHR ? 1 : 0;
+      enc_caps.encoder.codec.h265.stdSyntaxFlags
+      & VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_SET_BIT_KHR
+      ? 1 : 0;
   h265_std_pps.flags.weighted_pred_flag =
-      enc_caps.codec.h265enc.stdSyntaxFlags &
-      VK_VIDEO_ENCODE_H265_STD_WEIGHTED_PRED_FLAG_SET_BIT_KHR ? 1 : 0;
+      enc_caps.encoder.codec.h265.stdSyntaxFlags
+      & VK_VIDEO_ENCODE_H265_STD_WEIGHTED_PRED_FLAG_SET_BIT_KHR ? 1 : 0;
   h265_std_pps.flags.entropy_coding_sync_enabled_flag =
-      (enc_caps.codec.h265enc.maxTiles.width > 1
-      || enc_caps.codec.h265enc.maxTiles.height > 1) ? 1 : 0;
+      (enc_caps.encoder.codec.h265.maxTiles.width > 1
+      || enc_caps.encoder.codec.h265.maxTiles.height > 1)
+      ? 1 : 0;
   h265_std_pps.sps_video_parameter_set_id = vps_id;
   h265_std_pps.pps_seq_parameter_set_id = sps_id;
   h265_std_pps.pps_pic_parameter_set_id = pps_id;
 
+  /* *INDENT-OFF* */
   params_add = (VkVideoEncodeH265SessionParametersAddInfoKHR) {
-    /* *INDENT-OFF* */
     .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR,
     .pStdVPSs = &h265_std_vps,
     .stdVPSCount = 1,
@@ -899,18 +891,15 @@ setup_h265_encoder (uint32_t width, uint32_t height, gint vps_id,
     .stdSPSCount = 1,
     .pStdPPSs = &h265_std_pps,
     .stdPPSCount = 1,
-    /* *INDENT-ON* */
   };
-
   enc_params.h265 = (VkVideoEncodeH265SessionParametersCreateInfoKHR) {
-    /* *INDENT-OFF* */
     .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR,
     .maxStdVPSCount = 1,
     .maxStdSPSCount = 1,
     .maxStdPPSCount = 1,
     .pParametersAddInfo = &params_add
-    /* *INDENT-ON* */
   };
+  /* *INDENT-ON* */
 
   fail_unless (gst_vulkan_encoder_update_video_session_parameters (enc,
           &enc_params, &err));
@@ -943,12 +932,12 @@ check_encoded_frame (GstVulkanH265EncodeFrame * frame,
     GstH265NalUnitType nal_type)
 {
   GstMapInfo info;
-  fail_unless (frame->picture->out_buffer != NULL);
-  gst_buffer_map (frame->picture->out_buffer, &info, GST_MAP_READ);
+  fail_unless (frame->picture.out_buffer != NULL);
+  gst_buffer_map (frame->picture.out_buffer, &info, GST_MAP_READ);
   fail_unless (info.size);
   GST_MEMDUMP ("out buffer", info.data, info.size);
   check_h265_nalu (info.data, info.size, nal_type);
-  gst_buffer_unmap (frame->picture->out_buffer, &info);
+  gst_buffer_unmap (frame->picture.out_buffer, &info);
 }
 
 /* Greater than the maxDpbSlots == 16*/
@@ -979,13 +968,13 @@ GST_START_TEST (test_encoder_h265_i)
 
   /* Encode N_BUFFERS I-Frames */
   for (i = 0; i < N_BUFFERS; i++) {
-    frame = allocate_frame (enc, width, height, TRUE, 0);
+    frame = allocate_frame (enc, width, height, TRUE);
     encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_I,
         frame_num, NULL, 0, NULL, 0, vps_id, sps_id, pps_id);
     check_encoded_frame (frame, GST_H265_NAL_SLICE_IDR_W_RADL);
 
     frame_num++;
-    _h265_encode_frame_free (frame);
+    _h265_encode_frame_free (enc, frame);
   }
 
   fail_unless (gst_buffer_pool_set_active (buffer_pool, FALSE));
@@ -1021,7 +1010,7 @@ GST_START_TEST (test_encoder_h265_i_p)
   buffer_pool = allocate_buffer_pool (enc, width, height);
   img_pool = allocate_image_buffer_pool (enc, width, height);
 
-  frame = allocate_frame (enc, width, height, TRUE, 0);
+  frame = allocate_frame (enc, width, height, TRUE);
   /* Encode first picture as an IDR-Frame */
   encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_I,
       frame_num, NULL, 0, NULL, 0, vps_id, sps_id, pps_id);
@@ -1031,16 +1020,16 @@ GST_START_TEST (test_encoder_h265_i_p)
 
   /* Encode following pictures as a P-Frames */
   for (i = 1; i < N_BUFFERS; i++) {
-    frame = allocate_frame (enc, width, height, TRUE, list0_num);
-    frame->picture->pic_num = frame_num;
+    frame = allocate_frame (enc, width, height, TRUE);
+    frame->pic_num = frame_num;
     encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_P,
         frame_num, list0, list0_num, NULL, 0, vps_id, sps_id, pps_id);
     check_encoded_frame (frame, GST_H265_NAL_SLICE_TRAIL_R);
-    _h265_encode_frame_free (list0[0]);
+    _h265_encode_frame_free (enc, list0[0]);
     list0[0] = frame;
     frame_num++;
   }
-  _h265_encode_frame_free (list0[0]);
+  _h265_encode_frame_free (enc, list0[0]);
   fail_unless (gst_buffer_pool_set_active (buffer_pool, FALSE));
   gst_object_unref (buffer_pool);
   fail_unless (gst_buffer_pool_set_active (img_pool, FALSE));
@@ -1075,7 +1064,7 @@ GST_START_TEST (test_encoder_h265_i_p_b)
 
   fail_unless (gst_vulkan_encoder_caps (enc, &enc_caps));
 
-  if (!enc_caps.codec.h265enc.maxL1ReferenceCount) {
+  if (!enc_caps.encoder.codec.h265.maxL1ReferenceCount) {
     GST_WARNING ("Driver does not support B frames");
     goto beach;
   }
@@ -1084,8 +1073,8 @@ GST_START_TEST (test_encoder_h265_i_p_b)
   img_pool = allocate_image_buffer_pool (enc, width, height);
 
   /* Encode first picture as an IDR-Frame */
-  frame = allocate_frame (enc, width, height, TRUE, 0);
-  frame->picture->pic_num = frame_num;
+  frame = allocate_frame (enc, width, height, TRUE);
+  frame->pic_num = frame_num;
   encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_I,
       frame_num, NULL, 0, NULL, 0, vps_id, sps_id, pps_id);
   check_encoded_frame (frame, GST_H265_NAL_SLICE_IDR_W_RADL);
@@ -1093,8 +1082,8 @@ GST_START_TEST (test_encoder_h265_i_p_b)
   frame_num++;
 
   /* Encode 4th picture as a P-Frame */
-  frame = allocate_frame (enc, width, height, TRUE, list0_num);
-  frame->picture->pic_num = frame_num + 2;
+  frame = allocate_frame (enc, width, height, TRUE);
+  frame->pic_num = frame_num + 2;
   encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_P,
       frame_num, list0, list0_num, NULL, 0, vps_id, sps_id, pps_id);
   check_encoded_frame (frame, GST_H265_NAL_SLICE_TRAIL_R);
@@ -1102,25 +1091,25 @@ GST_START_TEST (test_encoder_h265_i_p_b)
   frame_num++;
 
   /* Encode 2nd picture as a B-Frame */
-  frame = allocate_frame (enc, width, height, FALSE, list0_num + list1_num);
-  frame->picture->pic_num = frame_num - 1;
+  frame = allocate_frame (enc, width, height, FALSE);
+  frame->pic_num = frame_num - 1;
   encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_B,
       frame_num, list0, list0_num, list1, list1_num, vps_id, sps_id, pps_id);
   check_encoded_frame (frame, GST_H265_NAL_SLICE_TRAIL_N);
   frame_num++;
-  _h265_encode_frame_free (frame);
+  _h265_encode_frame_free (enc, frame);
 
   /* Encode 3rd picture as a B-Frame */
-  frame = allocate_frame (enc, width, height, FALSE, list0_num + list1_num);
-  frame->picture->pic_num = frame_num - 1;
+  frame = allocate_frame (enc, width, height, FALSE);
+  frame->pic_num = frame_num - 1;
   encode_frame (enc, frame, STD_VIDEO_H265_SLICE_TYPE_B,
       frame_num, list0, list0_num, list1, list1_num, vps_id, sps_id, pps_id);
   check_encoded_frame (frame, GST_H265_NAL_SLICE_TRAIL_N);
   frame_num++;
-  _h265_encode_frame_free (frame);
+  _h265_encode_frame_free (enc, frame);
 
-  _h265_encode_frame_free (list0[0]);
-  _h265_encode_frame_free (list1[0]);
+  _h265_encode_frame_free (enc, list0[0]);
+  _h265_encode_frame_free (enc, list1[0]);
 
   fail_unless (gst_buffer_pool_set_active (buffer_pool, FALSE));
   gst_object_unref (buffer_pool);
